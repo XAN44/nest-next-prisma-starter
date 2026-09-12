@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.next/
+
+# Environment variables (ห้าม push ขึ้น git เด็ดขาด มีรหัสผ่าน)
+.env
+.env.local
+.env.*.local
+
+# Prisma generated files (สร้างใหม่ได้จาก schema เสมอ)
+packages/database/generated/
+
+# Logs
+npm-debug.log*
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI assistant skill files (ไม่จำเป็นต้องเก็บ ไม่กระทบการทำงานของโค้ด)
+packages/database/.agents/
+packages/database/.claude/
+packages/database/.windsurf/
+packages/database/skills-lock.json
