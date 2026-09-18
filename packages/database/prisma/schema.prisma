@@ -1,16 +1,466 @@
+// ============================================================================
+// schema.prisma — ระบบจัดการร้านค้าของชำ (Grocery POS + Inventory) — v2
+// ============================================================================
+// เปลี่ยนจาก v1 เฉพาะ 2 เรื่องที่สรุปกันแล้วว่า "ควรปรับ" เท่านั้น ไม่แตะส่วนอื่น:
+//
+// (1) MULTI-TENANT SCAFFOLDING — เพิ่ม Store + storeId บนทุกตารางธุรกิจ
+//     เหตุผล: ทำตอนนี้ (ยังไม่มีข้อมูลจริง) ถูกกว่าทำทีหลังมาก อ้างอิงจากงานวิจัย
+//     วงการ SaaS ที่ตรงกันหลายแหล่งว่า multi-tenancy ไม่ใช่ฟีเจอร์ที่ "เพิ่มทีหลังได้"
+//     แต่เป็นสมมติฐานที่ query/permission ทุกจุดถูกสร้างบนฐานนั้น การรีโทรฟิตทีหลัง
+//     มีค่าใช้จ่ายสูงถึง 60-80% ของงบสร้างระบบทั้งหมดตั้งแต่แรก
+//     แนวทาง: shared database เดียว ทุกตารางธุรกิจมี storeId ตรงๆ (ไม่ derive ผ่าน
+//     join เท่านั้น) เพื่อให้เขียน Row Level Security policy ตรงคอลัมน์ได้ง่าย
+//     — ยังคง "deploy เป็นระบบร้านเดียว" เหมือนเดิมทุกอย่าง แค่มีป้ายชื่อร้านติดไว้
+//
+// (2) WEIGHTED-AVERAGE COSTING แทน FIFO lot-splitting เต็มรูปแบบ
+//     เหตุผล: v1 ให้ SaleItem ผูกกับ StockLot เจาะจงทุกแถว (ตัดสต็อกแบบ FIFO ข้าม
+//     lot ได้) ซึ่งขัดกับโจทย์ที่ตั้งไว้ตั้งแต่ต้นว่า "ไม่เอาแบบพิศดารมาก" — FIFO
+//     ต้องมี row-lock ข้าม lot กันสองการขายพร้อมกันตัดสต็อกชนกัน ซึ่งซับซ้อนเกิน
+//     ความจำเป็นสำหรับร้านที่แค่อยากรู้กำไรคร่าวๆ ไม่ได้ยื่นบัญชีแบบละเอียด
+//     แนวทางใหม่: สำหรับสต็อกที่ร้าน "ซื้อขาดเป็นเจ้าของเอง" (PURCHASE) ใช้ต้นทุน
+//     เฉลี่ยถ่วงน้ำหนัก (moving average) เก็บเป็นตัวเลขเดียวที่ Product แล้วอัปเดต
+//     อัตโนมัติทุกครั้งที่รับของเข้า — ไม่ต้องเลือก lot ไม่ต้อง lock ข้าม lot
+//     ส่วนของ "ฝากขาย" (CONSIGNMENT) ยังต้องผูกกับ lot เจาะจงเหมือนเดิม เพราะจำเป็น
+//     ต่อการรู้ว่าต้องจ่ายคืนใครเท่าไหร่ (ไม่ใช่เรื่อง costing แต่เป็นเรื่องความเป็น
+//     เจ้าของสินค้า) — แต่เคสนี้เกิดไม่บ่อย (ของฝากขายมีปริมาณต่ำกว่ามาก) จึงยอมรับ
+//     ความซับซ้อนตรงจุดนี้ได้ ไม่กระทบเส้นทางขายหลักที่ถูกใช้หลักร้อยครั้ง/วัน
+//     StockLot ยังคงอยู่ครบเหมือนเดิมสำหรับทั้งสอง sourceType เพื่อเป็นประวัติราคา
+//     (ตอบ pain point เดิม "จำราคาที่รับมาไม่ได้") เพียงแต่ไม่ใช่ตัวตัดสต็อกโดยตรง
+//     สำหรับฝั่ง PURCHASE อีกต่อไป
+// ============================================================================
+
 generator client {
-  provider     = "prisma-client"
-  output       = "../generated/prisma"
-  moduleFormat = "cjs"
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
-model Task {
-  id        Int      @id @default(autoincrement())
-  title     String
-  done      Boolean  @default(false)
-  createdAt DateTime @default(now())
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  STAFF
+}
+
+enum SupplierType {
+  WHOLESALE
+  VILLAGER
+}
+
+enum LotSourceType {
+  PURCHASE     // ร้านซื้อขาดมาเป็นเจ้าของสต็อกเอง → ใช้ weighted-average costing
+  CONSIGNMENT  // รับฝากขาย ยังไม่ได้เป็นเจ้าของจนกว่าจะขายได้ → ยังต้องผูกกับ lot เจาะจง
+}
+
+enum PricingMode {
+  MANUAL
+  AUTO
+}
+
+enum StockMovementType {
+  IN
+  OUT_SALE
+  ADJUST
+}
+
+enum SettlementStatus {
+  PENDING
+  PAID
+}
+
+enum WastageResponsibility {
+  OWNER_ABSORBS
+  SUPPLIER_ABSORBS
+  UNDECIDED
+}
+
+enum PaymentMethod {
+  CASH
+  TRANSFER
+  MIXED
+}
+
+// ----------------------------------------------------------------------------
+// ★ ใหม่ — STORE
+// รากของ multi-tenancy ทั้งระบบ ทุกตารางธุรกิจด้านล่างมี storeId ชี้กลับมาที่นี่
+// รวมฟิลด์จาก StoreSettings เดิมเข้ามาไว้ในนี้แล้ว (ไม่มี StoreSettings แยกอีกต่อไป)
+// ตอน deploy จริงตอนนี้จะมีแค่ 1 แถวในตารางนี้ — แต่โครงสร้างรองรับหลายแถวได้ทันที
+// โดยไม่ต้อง migrate ใหญ่ในอนาคต
+// ----------------------------------------------------------------------------
+
+model Store {
+  id               String   @id @default(uuid())
+  name             String   @default("ร้านค้าของชำ")
+  phone            String?
+  defaultMarginPct Decimal  @db.Decimal(5, 2) @default(15.00) @map("default_margin_pct")
+  // ค่าเริ่มต้นล่างสุดของลำดับชั้น margin 3 ระดับ (product > category > store)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  users                  User[]
+  products               Product[]
+  categories             Category[]
+  suppliers              Supplier[]
+  stockLots              StockLot[]
+  sales                  Sale[]
+  stockMovements         StockMovement[]
+  consignmentSettlements ConsignmentSettlement[]
+
+  @@map("stores")
+}
+
+// ----------------------------------------------------------------------------
+// USER
+// ----------------------------------------------------------------------------
+
+model User {
+  id     String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  name         String
+  phone        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role     @default(STAFF)
+  isActive     Boolean  @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  sales              Sale[]
+  stockMovementsMade StockMovement[]     @relation("MovementCreatedBy")
+  refreshTokens      RefreshToken[]
+  pushSubscriptions  PushSubscription[]
+
+  @@index([storeId])
+  @@map("users")
+}
+
+model PushSubscription {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  endpoint  String @unique
+  p256dhKey String @map("p256dh_key")
+  authKey   String @map("auth_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+model RefreshToken {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ----------------------------------------------------------------------------
+// SUPPLIER
+// ----------------------------------------------------------------------------
+
+model Supplier {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  name  String
+  type  SupplierType
+  phone String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  stockLots              StockLot[]
+  consignmentSettlements ConsignmentSettlement[]
+
+  @@index([storeId, type])
+  // ★ แก้ไข — เติม storeId เป็นคอลัมน์แรกของ index เสมอ เพราะทุก query กรอง
+  // ด้วยร้านก่อนเป็นอันดับแรกตลอด (ดูหมายเหตุ multi-tenant ด้านบนไฟล์)
+  @@map("suppliers")
+}
+
+// ----------------------------------------------------------------------------
+// CATEGORY
+// ----------------------------------------------------------------------------
+
+model Category {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  name      String
+  marginPct Decimal? @db.Decimal(5, 2) @map("margin_pct")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  products Product[]
+
+  @@unique([storeId, name])
+  // ★ แก้ไข — เดิม name unique ทั้งระบบ ตอนนี้ unique แค่ภายในร้านเดียวกัน
+  // เพราะร้าน A กับร้าน B ต่างก็มีหมวด "ของแห้ง" ของตัวเองได้โดยไม่ชนกัน
+  @@map("categories")
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCT
+// ----------------------------------------------------------------------------
+
+model Product {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  name String
+
+  categoryId String?   @map("category_id")
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  targetMarginPct Decimal? @db.Decimal(5, 2) @map("target_margin_pct")
+
+  // ★ ใหม่ — ต้นทุนเฉลี่ยถ่วงน้ำหนักต่อหน่วยฐาน (แทนที่การอ่านจาก lot ที่เก่าที่สุด)
+  // อัปเดตอัตโนมัติทุกครั้งที่มี StockLot ใหม่ type = PURCHASE เข้ามา ด้วยสูตร:
+  //   newAvg = (avgCostPerBaseUnit * qtyOnHandBaseUnit + newLot.cost * newLot.qty)
+  //            / (qtyOnHandBaseUnit + newLot.qty)
+  // คำนวณและเขียนใน database transaction เดียวกับการสร้าง StockLot เสมอ
+  // ห้ามคำนวณแยก transaction เพราะจะเกิดช่วงเวลาที่ตัวเลขไม่ตรงกัน
+  avgCostPerBaseUnit Decimal @db.Decimal(10, 2) @default(0) @map("avg_cost_per_base_unit")
+
+  // ★ ใหม่ — จำนวนคงเหลือรวมของสินค้านี้ หน่วยเป็นหน่วยฐานเสมอ (denormalize)
+  // เป็น "แหล่งความจริงเดียว" ของยอดคงเหลือที่ใช้ตัดสต็อกตอนขาย (ทั้ง PURCHASE
+  // และ CONSIGNMENT รวมกัน) แทนการ sum จาก StockLot.qtyRemaining ทุกครั้งที่ query
+  // เหตุผลเดียวกับ salesCount บน ProductUnit: หน้าขายต้องอ่านเร็วที่สุด
+  qtyOnHandBaseUnit Decimal @db.Decimal(10, 3) @default(0) @map("qty_on_hand_base_unit")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  units     ProductUnit[]
+  stockLots StockLot[]
+
+  @@index([storeId, name])
+  @@index([storeId, categoryId])
+  @@map("products")
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCT_UNIT
+// ----------------------------------------------------------------------------
+
+model ProductUnit {
+  id        String  @id @default(uuid())
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  unitName String @map("unit_name")
+
+  barcode String? @unique
+
+  searchAliases String[] @default([]) @map("search_aliases")
+
+  salesCount Int     @default(0) @map("sales_count")
+  qtyPerBase Decimal @db.Decimal(10, 3) @map("qty_per_base")
+
+  pricingMode PricingMode @default(MANUAL) @map("pricing_mode")
+  manualPrice Decimal?    @db.Decimal(10, 2) @map("manual_price")
+
+  isActive Boolean @default(true) @map("is_active")
+
+  saleItems SaleItem[]
+
+  @@unique([productId, unitName])
+  @@index([salesCount(sort: Desc)])
+  @@map("product_units")
+}
+
+// ----------------------------------------------------------------------------
+// STOCK_LOT — ยังคงเป็น "ประวัติการรับของ" สำหรับทั้งสอง sourceType เหมือนเดิม
+// ต่างจาก v1 ตรงที่ตอนขาย (SaleItem) ไม่บังคับต้องผูกกับ lot นี้อีกต่อไป
+// ยกเว้นกรณี CONSIGNMENT ที่ยังจำเป็นต้องผูก (ดูคำอธิบายที่ SaleItem ด้านล่าง)
+// ----------------------------------------------------------------------------
+
+model StockLot {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id])
+
+  supplierId String?   @map("supplier_id")
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  sourceType      LotSourceType @map("source_type")
+  costPerBaseUnit Decimal       @db.Decimal(10, 2) @map("cost_per_base_unit")
+  qtyReceived     Decimal       @db.Decimal(10, 3) @map("qty_received")
+
+  qtyRemaining Decimal @db.Decimal(10, 3) @map("qty_remaining")
+  // ★ ความหมายเปลี่ยนไปตาม sourceType (จุดสำคัญที่ต้องเข้าใจตอน implement):
+  //   sourceType = PURCHASE    → ฟิลด์นี้เป็น "ข้อมูลอ้างอิงเชิงประวัติศาสตร์" เท่านั้น
+  //                               ไม่ใช่ตัวตัดสต็อกจริงอีกต่อไป (ดูที่ Product.qtyOnHandBaseUnit)
+  //                               จะไม่ลดลงเวลาขาย จะคงค่าเท่ากับ qtyReceived ตลอดไป
+  //                               เว้นแต่จะทำฟีเจอร์ "ดูว่าล็อตนี้ยังเหลือกี่ชิ้น" แบบประมาณการในอนาคต
+  //   sourceType = CONSIGNMENT → ฟิลด์นี้ยัง "เป็นตัวตัดจริง" เหมือน v1 เดิมทุกประการ
+  //                               เพราะต้องรู้ว่า lot ของใครขายไปแล้วกี่ชิ้น เพื่อคำนวณ
+  //                               ยอดจ่ายคืนใน ConsignmentSettlementItem ให้ถูกคน
+
+  receivedAt DateTime @default(now()) @map("received_at")
+
+  saleItems       SaleItem[]
+  settlementItems ConsignmentSettlementItem[]
+  stockMovements  StockMovement[]
+
+  @@index([storeId, productId, sourceType, receivedAt])
+  @@map("stock_lots")
+}
+
+// ----------------------------------------------------------------------------
+// SALE
+// ----------------------------------------------------------------------------
+
+model Sale {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  soldById    String  @map("sold_by_id")
+  soldBy      User    @relation(fields: [soldById], references: [id])
+  totalAmount Decimal @db.Decimal(12, 2) @map("total_amount")
+
+  paymentMethod  PaymentMethod @default(CASH) @map("payment_method")
+  cashAmount     Decimal       @default(0) @db.Decimal(12, 2) @map("cash_amount")
+  transferAmount Decimal       @default(0) @db.Decimal(12, 2) @map("transfer_amount")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  items SaleItem[]
+
+  @@index([storeId, createdAt])
+  @@index([storeId, paymentMethod, createdAt])
+  @@map("sales")
+}
+
+// ----------------------------------------------------------------------------
+// SALE_ITEM
+// ----------------------------------------------------------------------------
+
+model SaleItem {
+  id     String @id @default(uuid())
+  saleId String @map("sale_id")
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  productUnitId String      @map("product_unit_id")
+  productUnit   ProductUnit @relation(fields: [productUnitId], references: [id])
+
+  stockLotId String?   @map("stock_lot_id")
+  stockLot   StockLot? @relation(fields: [stockLotId], references: [id])
+  // ★ แก้ไข — เปลี่ยนจาก required เป็น nullable นี่คือจุดที่ตัดความซับซ้อนของ FIFO ออก
+  // กฎการใช้งานตอน implement service layer:
+  //   ขายสินค้าที่สต็อกปัจจุบันเป็น PURCHASE ล้วน → ปล่อย null ไม่ต้องเลือก lot ใดๆ
+  //   ตัด Product.qtyOnHandBaseUnit ตรงๆ, costSnapshot อ่านจาก Product.avgCostPerBaseUnit
+  //   ขายสินค้าที่มาจาก CONSIGNMENT lot → ต้องระบุ lot (เลือกจากล็อตที่เก่าสุดที่ยัง
+  //   เหลือของก่อน คล้าย FIFO เดิม แต่ทำเฉพาะในขอบเขตของ CONSIGNMENT lot เท่านั้น
+  //   ซึ่งมีจำนวนน้อยกว่ามากเมื่อเทียบกับสต็อกที่ร้านซื้อขาดมาเอง — ความซับซ้อนที่เหลืออยู่
+  //   จึงกระทบแค่เส้นทางขายที่ใช้บ่อยน้อยกว่ามาก ไม่ใช่ทุกการขายเหมือน v1)
+
+  qty       Decimal @db.Decimal(10, 3)
+  unitPrice Decimal @db.Decimal(10, 2) @map("unit_price")
+
+  costSnapshot Decimal @db.Decimal(10, 2) @map("cost_snapshot")
+  // ยังคง freeze ค่านี้ไว้ตอนขายเหมือนเดิม (historical data must be immutable)
+  // แหล่งที่มาต่างกันตาม stockLotId:
+  //   stockLotId = null  → คัดลอกจาก Product.avgCostPerBaseUnit ณ วินาทีที่ขาย
+  //   stockLotId มีค่า   → คัดลอกจาก StockLot.costPerBaseUnit ของ lot นั้นตรงๆ (เหมือน v1)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([stockLotId])
+  @@map("sale_items")
+}
+
+// ----------------------------------------------------------------------------
+// STOCK_MOVEMENT
+// ----------------------------------------------------------------------------
+
+model StockMovement {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  productId String            @map("product_id")
+  type      StockMovementType
+  qty       Decimal           @db.Decimal(10, 3)
+
+  reason String?
+
+  stockLotId String?   @map("stock_lot_id")
+  stockLot   StockLot? @relation(fields: [stockLotId], references: [id])
+  // nullable เหมือนเดิม — ตอนนี้ยิ่งมีความหมายชัดขึ้น: มีค่าเมื่อ movement เกี่ยวกับ
+  // CONSIGNMENT lot เจาะจง (รับเข้า/ขายออก/ปรับยอดของฝากขาย) หรือ ADJUST ทั่วไปที่
+  // อ้างอิง lot ใดก็ได้ ส่วน OUT_SALE ของสต็อกแบบ PURCHASE จะเป็น null เสมอ
+
+  wastageResponsibility WastageResponsibility? @map("wastage_responsibility")
+
+  createdById String @map("created_by_id")
+  createdBy   User   @relation("MovementCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([storeId, productId, createdAt])
+  @@map("stock_movements")
+}
+
+// ----------------------------------------------------------------------------
+// CONSIGNMENT_SETTLEMENT — ไม่แตะ logic เดิม ยังผูกกับ lot เจาะจงเหมือน v1 ทุกประการ
+// ----------------------------------------------------------------------------
+
+model ConsignmentSettlement {
+  id      String @id @default(uuid())
+  storeId String @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  supplierId String   @map("supplier_id")
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  periodStart DateTime          @map("period_start")
+  periodEnd   DateTime          @map("period_end")
+  totalAmount Decimal           @db.Decimal(12, 2) @map("total_amount")
+  status      SettlementStatus  @default(PENDING)
+  paidAt      DateTime?         @map("paid_at")
+
+  items ConsignmentSettlementItem[]
+
+  @@index([storeId, supplierId, status])
+  @@map("consignment_settlements")
+}
+
+model ConsignmentSettlementItem {
+  id           String                @id @default(uuid())
+  settlementId String                @map("settlement_id")
+  settlement   ConsignmentSettlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+
+  stockLotId String   @map("stock_lot_id")
+  stockLot   StockLot @relation(fields: [stockLotId], references: [id])
+
+  qtySettled    Decimal @db.Decimal(10, 3) @map("qty_settled")
+  amountSettled Decimal @db.Decimal(10, 2) @map("amount_settled")
+
+  @@unique([settlementId, stockLotId])
+  @@map("consignment_settlement_items")
 }
